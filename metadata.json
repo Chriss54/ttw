@@ -1,0 +1,5 @@
+{
+  "name": "V5 of Workflow Prompt: n8n Alchemist",
+  "description": "A psychedelic, structural IDE for voding n8n workflows. Features semantic block locking, dependency tracking, and hallucination detection.",
+  "requestFramePermissions": []
+}

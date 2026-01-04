@@ -1,0 +1,1273 @@
+{
+  "name": "My workflow 24",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "# n8n Workflow Builder Prompt: Graph RAG Agent\n\n## Workflow-Name\n`Graph RAG Agent copy`\n\n## Übersicht\nErstelle ein vollständiges RAG-System (Retrieval-Augmented Generation) mit zwei separaten Funktionsbereichen:\n\n1. **Data Ingestion Pipeline**: Klassifiziert eingehende Daten automatisch und speichert sie mit Embeddings in der korrekten Supabase-Tabelle\n2. **Query Agent**: Beantwortet Benutzeranfragen mittels Vektor-Suche und direkten Datenbankabfragen über einen Chat-Interface\n\nDas System arbeitet mit drei Tabellen: `documents`, `faqs` und `procedures`.\n\n---\n\n## ARCHITEKTUR\n\n```\n=== DATA INGESTION PIPELINE ===\n\n[Manual Trigger] → [Test File] → [Table Names] → [Classification Agent] → [Route to Table]\n                                                         ↓\n                    ┌──────────────────────────────────────┼──────────────────────────────────────┐\n                    ↓                                      ↓                                      ↓\n            [Message a model]                    [Message a model1]                    [Message a model2]\n            (documents schema)                     (faqs schema)                      (procedures schema)\n                    ↓                                      ↓                                      ↓\n            [content parser]                        [Split Out]                          [Edit Fields]\n                    ↓                                      ↓                                      ↓\n             [HTTP Request]                        [HTTP Request1]                       [HTTP Request2]\n            (OpenAI Embeddings)                   (OpenAI Embeddings)                  (OpenAI Embeddings)\n                    ↓                                      ↓                                      ↓\n            [Create a row]                        [Create a row1]                       [Create a row2]\n            (Supabase documents)                  (Supabase faqs)                     (Supabase procedures)\n\n\n=== QUERY AGENT ===\n\n[When chat message received] → [Query Agent1]\n                                     ↑\n        ┌────────────────────────────┼────────────────────────────┐\n        ↑                            ↑                            ↑\n[OpenAI Chat Model]          [Query Memory]              [6 AI Tools]\n                                                              ↓\n                    ┌─────────────────────────────────────────┼─────────────────────────────────────────┐\n                    ↓                    ↓                    ↓                    ↓                    ↓                    ↓\n         [Vector Store -      [Vector Store -      [Vector Store -      [Query Documents    [Query FAQs      [Query Procedures\n          Documents]              FAQs]            Procedures]            Table]             Table]            Table]\n              ↑                    ↑                    ↑\n    [OpenAI Embeddings]   [OpenAI Embeddings]   [OpenAI Embeddings]\n```\n\n---\n\n## TEIL 1: DATA INGESTION PIPELINE\n\n### Node 1: Manual Trigger - Data Ingestion\n**Typ:** Manual Trigger  \n**Name:** `Manual Trigger - Data Ingestion`  \n**Konfiguration:** Standard (keine Parameter)\n\n---\n\n### Node 2: Test File\n**Typ:** Set  \n**Name:** `Test File`\n\n**Konfiguration:**\n- Ein Feld mit leerem Namen (\"\") vom Typ Object\n- Enthält Test-JSON-Daten\n\n**Beispiel-Wert (Procedure):**\n```json\n{\n  \"title\": \"New Hire Laptop Setup\",\n  \"steps\": \"1. Remove laptop from shipping box and verify serial number matches asset tag\\n2. Power on and connect to WiFi network 'CompanySetup'\\n3. Run initial OS updates (approximately 30 minutes)\\n4. Install company security suite from USB drive provided by IT\\n5. Configure Outlook with employee credentials\\n6. Install required software: Slack, Zoom, Microsoft Office 365\\n7. Set up VPN client with credentials from welcome packet\\n8. Complete security training module\\n9. Return completed setup checklist to IT department\",\n  \"department\": \"IT\",\n  \"difficulty\": \"Easy\"\n}\n```\n\n---\n\n### Node 3: Table Names2\n**Typ:** Set  \n**Name:** `Table Names2`\n\n**Konfiguration:**\n- Include Other Fields: **true** (wichtig!)\n- 6 Felder definieren:\n\n| Feldname | Typ | Wert |\n|----------|-----|------|\n| table1 | Object | `{\"table1\":{\"name\":\"documents\",\"schema\":\"Company documentation, guides, and policies. Contains title (string) and content (long text). Used for policy documents, manuals, and reference materials.\"}}` |\n| table1 Schema | Object | `{\"table_id\":\"documents\",\"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"content\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"author\",\"type\":\"text\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]}` |\n| table2 | Object | `{\"table2\":{\"name\":\"faqs\",\"schema\":\"Frequently asked questions and answers. Contains question (string) and answer (long text). Used for common inquiries and their solutions.\"}}` |\n| table2 Schema | Object | `{\"table_id\":\"faqs\",\"schema\":[{\"name\":\"question\",\"type\":\"text\"},{\"name\":\"answer\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]}` |\n| table3 | Object | `{\"table3\":{\"name\":\"procedures\",\"schema\":\"Step-by-step instructions and procedures. Contains title (string) and steps (long text with numbered instructions). Used for process documentation and how-to guides.\"}}` |\n| table3 Schema | Object | `{\"table_id\":\"procedures\",\"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"steps\",\"type\":\"text\"},{\"name\":\"department\",\"type\":\"text\"},{\"name\":\"difficulty\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"prerequisite_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"}]}` |\n\n---\n\n### Node 4: Data Classification Agent1\n**Typ:** AI Agent (@n8n/n8n-nodes-langchain.agent)  \n**Name:** `Data Classification Agent1`\n\n**Konfiguration:**\n- Prompt Type: Define\n- Has Output Parser: **true**\n\n**Prompt Text:**\n```\nYou are a data classification expert. Analyze the data structure and content to determine the correct table.\n\n**Table Schemas:**\n- table1: {{ $json.table1.table1.toJsonString() }} : {{ $json[\"table1 Schema\"].toJsonString() }}\n- table2: {{ $json.table2.toJsonString() }}: {{ $json[\"table2 Schema\"].toJsonString() }}\n- table3: {{ $json.table3.toJsonString() }} : {{ $json[\"table3 Schema\"].toJsonString() }}\n\n**Data to classify:** \n{{ $('Test File').item.json.toJsonString() }}\n\nDetermine which table this data belongs to based on its structure and content type.\n```\n\n**Sub-Nodes (verbunden via ai_languageModel und ai_outputParser):**\n\n#### OpenAI Chat Model - Classification1\n**Typ:** OpenAI Chat Model (@n8n/n8n-nodes-langchain.lmChatOpenAi)  \n**Modell:** `gpt-4o-mini`\n\n#### Classification Schema Parser1\n**Typ:** Structured Output Parser (@n8n/n8n-nodes-langchain.outputParserStructured)  \n**Schema Type:** Manual\n\n**Input Schema:**\n```json\n{\n  \"type\": \"object\",\n  \"properties\": {\n    \"targetTable\": {\n      \"type\": \"string\",\n      \"enum\": [\"documents\", \"faqs\", \"procedures\"],\n      \"description\": \"The table name where data should be inserted\"\n    },\n    \"reasoning\": {\n      \"type\": \"string\",\n      \"description\": \"Explanation for the classification\"\n    }\n  },\n  \"required\": [\"targetTable\", \"reasoning\"]\n}\n```\n\n---\n\n### Node 5: Route to Table\n**Typ:** Switch  \n**Name:** `Route to Table`\n\n**Konfiguration:**\n- All Matching Outputs: **true**\n\n**3 Routing-Regeln basierend auf `{{ $json.output.targetTable }}`:**\n\n| Output | Bedingung | Wert |\n|--------|-----------|------|\n| 0 | equals | `documents` |\n| 1 | equals | `faqs` |\n| 2 | equals | `procedures` |\n\n---\n\n### PFAD 1: Documents\n\n#### Node: Message a model\n**Typ:** OpenAI Node (@n8n/n8n-nodes-langchain.openAi)  \n**Name:** `Message a model`\n\n**Konfiguration:**\n- Model: `gpt-4o-mini`\n- JSON Output: **true**\n- Messages:\n  - System Message:\n    ```\n    Review the information provided and parse the content to fit the following schema:\n\n    \"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"content\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"author\",\"type\":\"text\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]\n    ```\n  - User Message: `={{ $('Test File').item.json.toJsonString() }}`\n\n#### Node: content parser\n**Typ:** Set  \n**Name:** `content parser`\n\n**Konfiguration:**\n- 1 Feld:\n  - Name: `content to upload`\n  - Typ: Object\n  - Wert: `={{ $json.message.content }}`\n\n#### Node: HTTP Request (Embeddings für Documents)\n**Typ:** HTTP Request  \n**Name:** `HTTP Request`\n\n**Konfiguration:**\n- Method: POST\n- URL: `https://api.openai.com/v1/embeddings`\n- Authentication: Predefined Credential Type → OpenAI API\n- Headers:\n  - `Content-Type`: `application/json`\n- Body Parameters:\n  - `input`: `={{ $json['content to upload'].title }}: {{ $json['content to upload'].content }}`\n  - `model`: `text-embedding-3-small`\n\n#### Node: Create a row (Supabase Documents)\n**Typ:** Supabase  \n**Name:** `Create a row`\n\n**Konfiguration:**\n- Table: `documents`\n- Fields:\n  | Field | Value |\n  |-------|-------|\n  | title | `={{ $('content parser').item.json['content to upload'].title }}` |\n  | content | `={{ $('content parser').item.json['content to upload'].content }}` |\n  | category | `={{ $('content parser').item.json['content to upload'].category }}` |\n  | author | `={{ $('content parser').item.json['content to upload'].author }}` |\n  | related_faq_ids | `={{ $('content parser').item.json['content to upload'].related_faq_ids }}` |\n  | related_procedure_ids | `={{ $('content parser').item.json['content to upload'].related_procedure_ids }}` |\n  | metadata | `={{ $('content parser').item.json['content to upload'].title }}: {{ $('content parser').item.json['content to upload'].content }}` |\n  | embedding | `={{ $json.data[0].embedding }}` |\n\n---\n\n### PFAD 2: FAQs\n\n#### Node: Message a model1\n**Typ:** OpenAI Node  \n**Name:** `Message a model1`\n\n**Konfiguration:**\n- Model: `gpt-4o-mini`\n- JSON Output: **true**\n- Messages:\n  - System Message:\n    ```\n    Review the information provided and parse the content to fit the following schema:\n\n    \"schema\":[{\"name\":\"question\",\"type\":\"text\"},{\"name\":\"answer\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]\n\n    Each schema should be it's own object.\n    ```\n  - User Message: `={{ $('Test File').item.json.toJsonString() }}`\n\n#### Node: Split Out\n**Typ:** Split Out  \n**Name:** `Split Out`\n\n**Konfiguration:**\n- Field to Split Out: `message.content.schema`\n\n#### Node: HTTP Request1 (Embeddings für FAQs)\n**Typ:** HTTP Request  \n**Name:** `HTTP Request1`\n\n**Konfiguration:**\n- Method: POST\n- URL: `https://api.openai.com/v1/embeddings`\n- Authentication: Predefined Credential Type → OpenAI API\n- Headers:\n  - `Content-Type`: `application/json`\n- Body Parameters:\n  - `input`: `={{ $json.question }}: {{ $json.answer }}`\n  - `model`: `text-embedding-3-small`\n\n#### Node: Create a row1 (Supabase FAQs)\n**Typ:** Supabase  \n**Name:** `Create a row1`\n\n**Konfiguration:**\n- Table: `faqs`\n- Fields:\n  | Field | Value |\n  |-------|-------|\n  | question | `={{ $('Split Out').item.json.question }}` |\n  | answer | `={{ $('Split Out').item.json.answer }}` |\n  | category | `={{ $('Split Out').item.json.category }}` |\n  | metadata | `={{ $('Split Out').item.json.question }}: {{ $('Split Out').item.json.answer }}` |\n  | embedding | `={{ $json.data[0].embedding }}` |\n\n---\n\n### PFAD 3: Procedures\n\n#### Node: Message a model2\n**Typ:** OpenAI Node  \n**Name:** `Message a model2`\n\n**Konfiguration:**\n- Model: `gpt-4o-mini`\n- JSON Output: **true**\n- Messages:\n  - System Message:\n    ```\n    Review the information provided and parse the content to fit the following schema:\n\n    \"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"steps\",\"type\":\"text\"},{\"name\":\"department\",\"type\":\"text\"},{\"name\":\"difficulty\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"prerequisite_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"}]\n    ```\n  - User Message: `={{ $('Test File').item.json.toJsonString() }}`\n\n#### Node: Edit Fields\n**Typ:** Set  \n**Name:** `Edit Fields`\n\n**Konfiguration:**\n- 1 Feld:\n  - Name: `` (leer)\n  - Typ: Object\n  - Wert: `={{ $json.message.content }}`\n\n#### Node: HTTP Request2 (Embeddings für Procedures)\n**Typ:** HTTP Request  \n**Name:** `HTTP Request2`\n\n**Konfiguration:**\n- Method: POST\n- URL: `https://api.openai.com/v1/embeddings`\n- Authentication: Predefined Credential Type → OpenAI API\n- Headers:\n  - `Content-Type`: `application/json`\n- Body Parameters:\n  - `input`: `={{ $json[''].title }}: {{ $json[''].steps }}`\n  - `model`: `text-embedding-3-small`\n\n#### Node: Create a row2 (Supabase Procedures)\n**Typ:** Supabase  \n**Name:** `Create a row2`\n\n**Konfiguration:**\n- Table: `procedures`\n- Fields:\n  | Field | Value |\n  |-------|-------|\n  | title | `={{ $('Edit Fields').item.json[''].title }}` |\n  | steps | `={{ $('Edit Fields').item.json[''].steps }}` |\n  | department | `={{ $('Edit Fields').item.json[''].department }}` |\n  | difficulty | `={{ $('Edit Fields').item.json[''].difficulty }}` |\n  | embedding | `={{ $json.data[0].embedding }}` |\n\n---\n\n## TEIL 2: QUERY AGENT\n\n### Node 1: When chat message received\n**Typ:** Chat Trigger (@n8n/n8n-nodes-langchain.chatTrigger)  \n**Name:** `When chat message received`\n\n**Konfiguration:** Standard (keine besonderen Parameter)\n\n---\n\n### Node 2: Query Agent1\n**Typ:** AI Agent (@n8n/n8n-nodes-langchain.agent)  \n**Name:** `Query Agent1`\n\n**System Message:**\n```\nYou are an intelligent query agent with two search strategies:\n\n**1. Vector Search (semantic):** Use for conceptual queries and natural language questions\n- Search Documents: policy information, guides, documentation\n- Search FAQs: common questions and answers\n- Search Procedures: step-by-step instructions\n\n**2. Direct Queries (structured):** Use after vector search to get complete records or traverse relationships\n- Query Documents by ID\n- Query FAQs by ID or source_document_id\n- Query Procedures by ID or source_document_id\n\n**Workflow:**\n1. Use vector search to find relevant records\n2. Extract IDs from results\n3. Use Supabase Query tools to get complete data or follow relationships\n4. Synthesize comprehensive answer\n5. Always cite sources and ony use the database for answers\n```\n\n**Sub-Nodes (alle via ai_* Verbindungen):**\n\n---\n\n#### OpenAI Chat Model - Query1\n**Typ:** OpenAI Chat Model  \n**Name:** `OpenAI Chat Model - Query1`  \n**Verbindung:** ai_languageModel → Query Agent1\n\n**Konfiguration:**\n- Model: `gpt-4o-mini`\n\n---\n\n#### Query Memory1\n**Typ:** Window Buffer Memory (@n8n/n8n-nodes-langchain.memoryBufferWindow)  \n**Name:** `Query Memory1`  \n**Verbindung:** ai_memory → Query Agent1\n\n**Konfiguration:** Standard\n\n---\n\n### VECTOR STORE TOOLS (3x)\n\n#### Vector Store - Documents\n**Typ:** Supabase Vector Store (@n8n/n8n-nodes-langchain.vectorStoreSupabase)  \n**Name:** `Vector Store - Documents`  \n**Verbindung:** ai_tool → Query Agent1\n\n**Konfiguration:**\n- Mode: `retrieve-as-tool`\n- Tool Description: `Search documents table for policies, guides, and documentation using semantic similarity. Returns title, content, category, author.`\n- Table Name: `documents`\n- Top K: `10`\n\n**Sub-Node:**\n- **OpenAI Embeddings - Query** (Verbindung: ai_embedding)\n  - Model: `text-embedding-3-large`\n\n---\n\n#### Vector Store - FAQs\n**Typ:** Supabase Vector Store  \n**Name:** `Vector Store - FAQs`  \n**Verbindung:** ai_tool → Query Agent1\n\n**Konfiguration:**\n- Mode: `retrieve-as-tool`\n- Tool Description: `Search FAQs table for questions and answers using semantic similarity. Returns question, answer, category, source_document_id.`\n- Table Name: `faqs`\n- Top K: `10`\n\n**Sub-Node:**\n- **OpenAI Embeddings - Query 4** (Verbindung: ai_embedding)\n  - Model: `text-embedding-3-large`\n\n---\n\n#### Vector Store - Procedures\n**Typ:** Supabase Vector Store  \n**Name:** `Vector Store - Procedures`  \n**Verbindung:** ai_tool → Query Agent1\n\n**Konfiguration:**\n- Mode: `retrieve-as-tool`\n- Tool Description: `Search procedures table for step-by-step instructions using semantic similarity. Returns title, steps, department, difficulty.`\n- Table Name: `procedures`\n- Top K: `10`\n\n**Sub-Node:**\n- **OpenAI Embeddings - Query 5** (Verbindung: ai_embedding)\n  - Model: `text-embedding-3-large`\n\n---\n\n### SUPABASE QUERY TOOLS (3x)\n\n#### Query Documents Table\n**Typ:** Supabase Tool (@n8n/n8n-nodes-base.supabaseTool)  \n**Name:** `Query Documents Table`  \n**Verbindung:** ai_tool → Query Agent1\n\n**Konfiguration:**\n- Operation: `getAll`\n- Table: `documents`\n\n---\n\n#### Query FAQs Table\n**Typ:** Supabase Tool  \n**Name:** `Query FAQs Table`  \n**Verbindung:** ai_tool → Query Agent1\n\n**Konfiguration:**\n- Operation: `getAll`\n- Table: `faqs`\n\n---\n\n#### Query Procedures Table\n**Typ:** Supabase Tool  \n**Name:** `Query Procedures Table`  \n**Verbindung:** ai_tool → Query Agent1\n\n**Konfiguration:**\n- Operation: `getAll`\n- Table: `procedures`\n\n---\n\n## VERBINDUNGEN (Connections)\n\n### Data Ingestion Pipeline (main connections)\n```\nManual Trigger - Data Ingestion → Test File\nTest File → Table Names2\nTable Names2 → Data Classification Agent1\nData Classification Agent1 → Route to Table\n\nRoute to Table:\n  Output 0 (documents) → Message a model\n  Output 1 (faqs) → Message a model1\n  Output 2 (procedures) → Message a model2\n\nMessage a model → content parser → HTTP Request → Create a row\nMessage a model1 → Split Out → HTTP Request1 → Create a row1\nMessage a model2 → Edit Fields → HTTP Request2 → Create a row2\n```\n\n### Data Classification Agent1 (AI connections)\n```\nOpenAI Chat Model - Classification1 --[ai_languageModel]--> Data Classification Agent1\nClassification Schema Parser1 --[ai_outputParser]--> Data Classification Agent1\n```\n\n### Query Agent (main + AI connections)\n```\nWhen chat message received → Query Agent1\n\nOpenAI Chat Model - Query1 --[ai_languageModel]--> Query Agent1\nQuery Memory1 --[ai_memory]--> Query Agent1\n\nVector Store - Documents --[ai_tool]--> Query Agent1\nVector Store - FAQs --[ai_tool]--> Query Agent1\nVector Store - Procedures --[ai_tool]--> Query Agent1\n\nQuery Documents Table --[ai_tool]--> Query Agent1\nQuery FAQs Table --[ai_tool]--> Query Agent1\nQuery Procedures Table --[ai_tool]--> Query Agent1\n\nOpenAI Embeddings - Query --[ai_embedding]--> Vector Store - Documents\nOpenAI Embeddings - Query 4 --[ai_embedding]--> Vector Store - FAQs\nOpenAI Embeddings - Query 5 --[ai_embedding]--> Vector Store - Procedures\n```\n\n---\n\n## ERFORDERLICHE CREDENTIALS\n\n1. **OpenAI API**\n   - Für alle LLM-Calls (gpt-4o-mini)\n   - Für Embedding-Generierung (text-embedding-3-small für Ingestion)\n   - Für Vector Store Embeddings (text-embedding-3-large für Query)\n\n2. **Supabase**\n   - Für alle Tabellen-Operationen (Create, Query)\n   - Für Vector Store Zugriff\n\n---\n\n## SUPABASE SETUP (SQL)\n\n```sql\n-- Enable pgvector\nCREATE EXTENSION IF NOT EXISTS vector;\n\n-- Documents table\nCREATE TABLE documents (\n  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,\n  title TEXT NOT NULL,\n  content TEXT NOT NULL,\n  embedding VECTOR(1536),\n  category TEXT,\n  author TEXT,\n  related_faq_ids UUID[],\n  related_procedure_ids UUID[],\n  metadata JSONB,\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n\n-- FAQs table\nCREATE TABLE faqs (\n  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,\n  question TEXT NOT NULL,\n  answer TEXT NOT NULL,\n  embedding VECTOR(1536),\n  category TEXT,\n  source_document_id UUID,\n  related_procedure_ids UUID[],\n  metadata JSONB,\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n\n-- Procedures table\nCREATE TABLE procedures (\n  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,\n  title TEXT NOT NULL,\n  steps TEXT NOT NULL,\n  embedding VECTOR(1536),\n  department TEXT,\n  difficulty TEXT,\n  source_document_id UUID,\n  prerequisite_procedure_ids UUID[],\n  related_faq_ids UUID[],\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n```\n\n---\n\n## WICHTIGE HINWEISE\n\n### Embedding-Modelle\n- **Ingestion**: `text-embedding-3-small` (via HTTP Request)\n- **Query**: `text-embedding-3-large` (via OpenAI Embeddings Node)\n\n⚠️ **ACHTUNG**: Die unterschiedlichen Embedding-Modelle für Ingestion vs. Query können zu Problemen führen! Für konsistente Ergebnisse sollten beide dasselbe Modell verwenden.\n\n### Switch Node Option\n- `allMatchingOutputs: true` ermöglicht, dass Daten gleichzeitig in mehrere Tabellen geroutet werden können (falls die Klassifikation mehrere Matches ergibt)\n\n### Test-Daten Beispiele\n\n**Document:**\n```json\n{\n  \"title\": \"Remote Work Policy\",\n  \"content\": \"This policy outlines the guidelines for remote work arrangements...\",\n  \"category\": \"HR\",\n  \"author\": \"HR Department\"\n}\n```\n\n**FAQ:**\n```json\n{\n  \"question\": \"How do I reset my password?\",\n  \"answer\": \"To reset your password, click 'Forgot Password' on the login page...\",\n  \"category\": \"IT Support\"\n}\n```\n\n**Procedure:**\n```json\n{\n  \"title\": \"New Hire Laptop Setup\",\n  \"steps\": \"1. Remove laptop from box...\\n2. Power on...\",\n  \"department\": \"IT\",\n  \"difficulty\": \"Easy\"\n}\n```\n\n---\n\n## STICKY NOTES (Optional)\n\n4 Sticky Notes für Dokumentation:\n1. **\"Query Agent - With Table Traversal\"** (bei Query-Bereich)\n2. **\"Multi-Table Document Ingestion\"** (bei Ingestion-Bereich)\n3. **SQL Commands für Supabase** (mit CREATE TABLE Statements)\n4. **RAG System Overview** (mit Architektur-Diagramm und Setup-Checklist)"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        96,
+        -160
+      ],
+      "typeVersion": 1,
+      "id": "67d40f59-0ed4-4f6f-b8b8-cf25e69fa1d4",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {},
+      "id": "803f5cad-8a43-42eb-a3a1-2f4b0c7d9991",
+      "name": "Manual Trigger - Data Ingestion",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        944,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "",
+              "value": "={ \"title\": \"New Hire Laptop Setup\", \"steps\": \"1. Remove laptop from shipping box and verify serial number matches asset tag\\n2. Power on and connect to WiFi network 'CompanySetup'\\n3. Run initial OS updates (approximately 30 minutes)\\n4. Install company security suite from USB drive provided by IT\\n5. Configure Outlook with employee credentials\\n6. Install required software: Slack, Zoom, Microsoft Office 365\\n7. Set up VPN client with credentials from welcome packet\\n8. Complete security training module\\n9. Return completed setup checklist to IT department\", \"department\": \"IT\", \"difficulty\": \"Easy\" }",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3ae5e82c-0bb8-4c8c-8636-9490d1802bfb",
+      "name": "Test File",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1168,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "table1",
+              "value": "={{ JSON.stringify({\"table1\":{\"name\":\"documents\",\"schema\":\"Company documentation, guides, and policies. Contains title (string) and content (long text). Used for policy documents, manuals, and reference materials.\"}}) }}",
+              "type": "object"
+            },
+            {
+              "id": "id-2",
+              "name": "table1 Schema",
+              "value": "={{ JSON.stringify({\"table_id\":\"documents\",\"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"content\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"author\",\"type\":\"text\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]}) }}",
+              "type": "object"
+            },
+            {
+              "id": "id-3",
+              "name": "table2",
+              "value": "={{ JSON.stringify({\"table2\":{\"name\":\"faqs\",\"schema\":\"Frequently asked questions and answers. Contains question (string) and answer (long text). Used for common inquiries and their solutions.\"}}) }}",
+              "type": "object"
+            },
+            {
+              "id": "id-4",
+              "name": "table2 Schema",
+              "value": "={{ JSON.stringify({\"table_id\":\"faqs\",\"schema\":[{\"name\":\"question\",\"type\":\"text\"},{\"name\":\"answer\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]}) }}",
+              "type": "object"
+            },
+            {
+              "id": "id-5",
+              "name": "table3",
+              "value": "={{ JSON.stringify({\"table3\":{\"name\":\"procedures\",\"schema\":\"Step-by-step instructions and procedures. Contains title (string) and steps (long text with numbered instructions). Used for process documentation and how-to guides.\"}}) }}",
+              "type": "object"
+            },
+            {
+              "id": "id-6",
+              "name": "table3 Schema",
+              "value": "={{ JSON.stringify({\"table_id\":\"procedures\",\"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"steps\",\"type\":\"text\"},{\"name\":\"department\",\"type\":\"text\"},{\"name\":\"difficulty\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"prerequisite_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"}]}) }}",
+              "type": "object"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "97c62804-cfc0-49f9-8c3c-cb5d92b136f8",
+      "name": "Table Names2",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1392,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=**Table Schemas:**\n- table1: {{ $json.table1.table1.toJsonString() }} : {{ $json[\"table1 Schema\"].toJsonString() }}\n- table2: {{ $json.table2.toJsonString() }}: {{ $json[\"table2 Schema\"].toJsonString() }}\n- table3: {{ $json.table3.toJsonString() }} : {{ $json[\"table3 Schema\"].toJsonString() }}\n\n**Data to classify:** \n{{ $('Test File').item.json.toJsonString() }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are a data classification expert. Analyze the data structure and content to determine the correct table based on the provided schemas."
+        }
+      },
+      "id": "7213558b-91d2-445c-b774-ac1801c9219c",
+      "name": "Data Classification Agent1",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        1616,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4o-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "54a672d7-3dac-44eb-ace2-bda51ee6d9b6",
+      "name": "OpenAI Chat Model - Classification1",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        1632,
+        752
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"targetTable\":{\"type\":\"string\",\"enum\":[\"documents\",\"faqs\",\"procedures\"],\"description\":\"The table name where data should be inserted\"},\"reasoning\":{\"type\":\"string\",\"description\":\"Explanation for the classification\"}},\"required\":[\"targetTable\",\"reasoning\"]}"
+      },
+      "id": "fafd8f31-1364-49c1-854c-e55f0caf406b",
+      "name": "Classification Schema Parser1",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1760,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.output.targetTable }}",
+                    "rightValue": "documents",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "documents"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.output.targetTable }}",
+                    "rightValue": "faqs",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "faqs"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.output.targetTable }}",
+                    "rightValue": "procedures",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "procedures"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f0934b78-fcda-4243-a6ca-2cd383fe4e42",
+      "name": "Route to Table",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1968,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4o-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Review the information provided and parse the content to fit the following schema:\n\n\"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"content\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"author\",\"type\":\"text\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]"
+            },
+            {
+              "content": "={{ $('Test File').item.json.toJsonString() }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "8f027aea-dee2-44e0-a7c1-deabfe33d236",
+      "name": "Message a model",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        2192,
+        720
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "content to upload",
+              "value": "={{ $json.message.content }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2b206bde-ac24-4d12-85cd-32846efc158c",
+      "name": "content parser",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2544,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ $json['content to upload'].title }}: {{ $json['content to upload'].content }}"
+            },
+            {
+              "name": "model",
+              "value": "text-embedding-3-small"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "4594909f-e3c3-42ce-ac8b-5ac5a9a47e5c",
+      "name": "HTTP Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2768,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "documents",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "title",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].title }}"
+            },
+            {
+              "fieldId": "content",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].content }}"
+            },
+            {
+              "fieldId": "category",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].category }}"
+            },
+            {
+              "fieldId": "author",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].author }}"
+            },
+            {
+              "fieldId": "related_faq_ids",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].related_faq_ids }}"
+            },
+            {
+              "fieldId": "related_procedure_ids",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].related_procedure_ids }}"
+            },
+            {
+              "fieldId": "metadata",
+              "fieldValue": "={{ $('content parser').item.json['content to upload'].title }}: {{ $('content parser').item.json['content to upload'].content }}"
+            },
+            {
+              "fieldId": "embedding",
+              "fieldValue": "={{ $json.data[0].embedding }}"
+            }
+          ]
+        }
+      },
+      "id": "b75df242-da96-4f3a-ac03-d61c379508ba",
+      "name": "Create a row",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        2992,
+        720
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4o-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Review the information provided and parse the content to fit the following schema:\n\n\"schema\":[{\"name\":\"question\",\"type\":\"text\"},{\"name\":\"answer\",\"type\":\"text\"},{\"name\":\"category\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"related_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"metadata\",\"type\":\"jsonb\"}]\n\nEach schema should be it's own object."
+            },
+            {
+              "content": "={{ $('Test File').item.json.toJsonString() }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "c5421f82-6dcd-499c-9a75-45740a2bc9c2",
+      "name": "Message a model1",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        2192,
+        336
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "message.content.schema",
+        "options": {}
+      },
+      "id": "4a49107b-a333-49e9-baa1-da5089ad93ae",
+      "name": "Split Out",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2544,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ $json.question }}: {{ $json.answer }}"
+            },
+            {
+              "name": "model",
+              "value": "text-embedding-3-small"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a4a56216-24fe-4236-aa0e-5f744e3f5210",
+      "name": "HTTP Request1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2768,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "faqs",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "question",
+              "fieldValue": "={{ $('Split Out').item.json.question }}"
+            },
+            {
+              "fieldId": "answer",
+              "fieldValue": "={{ $('Split Out').item.json.answer }}"
+            },
+            {
+              "fieldId": "category",
+              "fieldValue": "={{ $('Split Out').item.json.category }}"
+            },
+            {
+              "fieldId": "metadata",
+              "fieldValue": "={{ $('Split Out').item.json.question }}: {{ $('Split Out').item.json.answer }}"
+            },
+            {
+              "fieldId": "embedding",
+              "fieldValue": "={{ $json.data[0].embedding }}"
+            }
+          ]
+        }
+      },
+      "id": "b7e066ef-1bec-4493-9ff9-3a25f6f3193b",
+      "name": "Create a row1",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        2992,
+        336
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4o-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Review the information provided and parse the content to fit the following schema:\n\n\"schema\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"steps\",\"type\":\"text\"},{\"name\":\"department\",\"type\":\"text\"},{\"name\":\"difficulty\",\"type\":\"text\"},{\"name\":\"source_document_id\",\"type\":\"uuid\"},{\"name\":\"prerequisite_procedure_ids\",\"type\":\"_uuid\"},{\"name\":\"related_faq_ids\",\"type\":\"_uuid\"}]"
+            },
+            {
+              "content": "={{ $('Test File').item.json.toJsonString() }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "c478d456-a8fc-43e7-b4e2-61f8cfae7a05",
+      "name": "Message a model2",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        2192,
+        528
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "",
+              "value": "={{ $json.message.content }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "288cabef-93be-4fdb-8cfe-958b25a53241",
+      "name": "Edit Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2544,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ $json[''].title }}: {{ $json[''].steps }}"
+            },
+            {
+              "name": "model",
+              "value": "text-embedding-3-small"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "114ff7af-b182-438e-95c1-28ea2d4faf79",
+      "name": "HTTP Request2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2768,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "procedures",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "title",
+              "fieldValue": "={{ $('Edit Fields').item.json.title }}"
+            },
+            {
+              "fieldId": "steps",
+              "fieldValue": "={{ $('Edit Fields').item.json.steps }}"
+            },
+            {
+              "fieldId": "department",
+              "fieldValue": "={{ $('Edit Fields').item.json.department }}"
+            },
+            {
+              "fieldId": "difficulty",
+              "fieldValue": "={{ $('Edit Fields').item.json.difficulty }}"
+            },
+            {
+              "fieldId": "embedding",
+              "fieldValue": "={{ $json.data[0].embedding }}"
+            }
+          ]
+        }
+      },
+      "id": "ef1b4ccd-63df-437e-ade8-02e0d137afad",
+      "name": "Create a row2",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        2992,
+        528
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "0a5e0640-6fdf-4d43-a5c2-cdcdabc3a8f7",
+      "name": "When chat message received",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        944,
+        1152
+      ],
+      "webhookId": "4eeb56e8-ab71-47ad-a315-e95d100310f6"
+    },
+    {
+      "parameters": {
+        "options": {
+          "systemMessage": "You are an intelligent query agent with two search strategies:\n\n**1. Vector Search (semantic):** Use for conceptual queries and natural language questions\n- Search Documents: policy information, guides, documentation\n- Search FAQs: common questions and answers\n- Search Procedures: step-by-step instructions\n\n**2. Direct Queries (structured):** Use after vector search to get complete records or traverse relationships\n- Query Documents by ID\n- Query FAQs by ID or source_document_id\n- Query Procedures by ID or source_document_id\n\n**Workflow:**\n1. Use vector search to find relevant records\n2. Extract IDs from results\n3. Use Supabase Query tools to get complete data or follow relationships\n4. Synthesize comprehensive answer\n5. Always cite sources and only use the database for answers"
+        }
+      },
+      "id": "15e015fc-8b7f-4b9e-90cf-f7ba3ef48360",
+      "name": "Query Agent1",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        1872,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4o-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "9088abe2-0335-411b-bf1a-bf0e74b7b908",
+      "name": "OpenAI Chat Model - Query1",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        1168,
+        1376
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "c7727210-f95c-4aee-a9d6-278f41f083b6",
+      "name": "Query Memory1",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        1296,
+        1376
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolDescription": "Search documents table for policies, guides, and documentation using semantic similarity. Returns title, content, category, author.",
+        "tableName": {
+          "__rl": true,
+          "mode": "id",
+          "value": "documents"
+        },
+        "topK": 10,
+        "options": {}
+      },
+      "id": "5c681858-6ace-4bdb-9ce3-6f74ebe4336c",
+      "name": "Vector Store - Documents",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.3,
+      "position": [
+        1424,
+        1376
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-large",
+        "options": {}
+      },
+      "id": "beb99f64-b596-426c-8fe4-ac8fe006abc4",
+      "name": "OpenAI Embeddings - Query",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1504,
+        1584
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolDescription": "Search FAQs table for questions and answers using semantic similarity. Returns question, answer, category, source_document_id.",
+        "tableName": {
+          "__rl": true,
+          "mode": "id",
+          "value": "faqs"
+        },
+        "topK": 10,
+        "options": {}
+      },
+      "id": "56352d6d-de6a-4bfb-a68a-f61518d3ce96",
+      "name": "Vector Store - FAQs",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.3,
+      "position": [
+        1712,
+        1376
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-large",
+        "options": {}
+      },
+      "id": "606a2bf7-ea7d-4c04-a2bf-8ec86d7c364d",
+      "name": "OpenAI Embeddings - Query 4",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1792,
+        1584
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolDescription": "Search procedures table for step-by-step instructions using semantic similarity. Returns title, steps, department, difficulty.",
+        "tableName": {
+          "__rl": true,
+          "mode": "id",
+          "value": "procedures"
+        },
+        "topK": 10,
+        "options": {}
+      },
+      "id": "ee37fd26-41ea-4005-a543-be8605b86688",
+      "name": "Vector Store - Procedures",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.3,
+      "position": [
+        2000,
+        1376
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-large",
+        "options": {}
+      },
+      "id": "d5b4d9b6-8a0d-48b6-913a-d7926430b038",
+      "name": "OpenAI Embeddings - Query 5",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        2080,
+        1584
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "UkkBac0y6p8xHcrW",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "documents"
+      },
+      "id": "433c1927-3d75-4365-8d6c-0f060c2464b1",
+      "name": "Query Documents Table",
+      "type": "n8n-nodes-base.supabaseTool",
+      "typeVersion": 1,
+      "position": [
+        2288,
+        1376
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "faqs"
+      },
+      "id": "81126d7a-6411-44d1-a831-2faa2fbbb9e4",
+      "name": "Query FAQs Table",
+      "type": "n8n-nodes-base.supabaseTool",
+      "typeVersion": 1,
+      "position": [
+        2416,
+        1376
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "procedures"
+      },
+      "id": "cdcb282e-bcee-46bb-8b38-1d8f472b1a67",
+      "name": "Query Procedures Table",
+      "type": "n8n-nodes-base.supabaseTool",
+      "typeVersion": 1,
+      "position": [
+        2544,
+        1376
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "yENDsikgS1RKuuQb",
+          "name": "New All N8N Supabase"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger - Data Ingestion": {
+      "main": [
+        [
+          {
+            "node": "Test File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test File": {
+      "main": [
+        [
+          {
+            "node": "Table Names2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Table Names2": {
+      "main": [
+        [
+          {
+            "node": "Data Classification Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model - Classification1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Data Classification Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification Schema Parser1": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Data Classification Agent1",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Classification Agent1": {
+      "main": [
+        [
+          {
+            "node": "Route to Table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route to Table": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Message a model2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "content parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "content parser": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Create a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model1": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Create a row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model2": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request2": {
+      "main": [
+        [
+          {
+            "node": "Create a row2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model - Query1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector Store - Documents": {
+      "ai_tool": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Embeddings - Query": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Vector Store - Documents",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector Store - FAQs": {
+      "ai_tool": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Embeddings - Query 4": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Vector Store - FAQs",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector Store - Procedures": {
+      "ai_tool": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Embeddings - Query 5": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Vector Store - Procedures",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Documents Table": {
+      "ai_tool": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query FAQs Table": {
+      "ai_tool": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Procedures Table": {
+      "ai_tool": [
+        [
+          {
+            "node": "Query Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "836ca20a-86bb-418a-8ae7-b7f0ba6effb2",
+  "meta": {
+    "instanceId": "95a2efba7410b7ccc90c9828f2155e5bfcdeec3b3cb88bb75bc39aefe11facd8"
+  },
+  "id": "nttDrM2kVeHmD5Np",
+  "tags": []
+}
